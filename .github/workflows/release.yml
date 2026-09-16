@@ -1,0 +1,201 @@
+name: Build & Release
+
+# Baut proxmox-backup-client für Ubuntu, spiegelt die Proxmox-Originale für Debian und
+# veröffentlicht alles als GitHub-Release. debian-collection-repo holt die .debs aus dem
+# neuesten Release ab. Ein Release entsteht nur, wenn sich etwas geändert hat
+# (neue Upstream-Version, neue Proxmox-Pakete oder geänderte Build-Skripte).
+
+on:
+  schedule:
+    # täglich, vor dem Lauf von debian-collection-repo (02:00 UTC)
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release auch ohne Änderungen erzeugen"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "docker/**"
+      - "keys/**"
+      - ".github/workflows/release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: write # Keepalive, siehe letzter Schritt
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      tag: ${{ steps.decide.outputs.tag }}
+      revision: ${{ steps.decide.outputs.revision }}
+      PBS_VERSION: ${{ steps.sources.outputs.PBS_VERSION }}
+      PBS_COMMIT: ${{ steps.sources.outputs.PBS_COMMIT }}
+      PROXMOX_COMMIT: ${{ steps.sources.outputs.PROXMOX_COMMIT }}
+      PXAR_COMMIT: ${{ steps.sources.outputs.PXAR_COMMIT }}
+      PATHPATTERNS_COMMIT: ${{ steps.sources.outputs.PATHPATTERNS_COMMIT }}
+      PROXMOX_FUSE_COMMIT: ${{ steps.sources.outputs.PROXMOX_FUSE_COMMIT }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Resolve upstream sources
+        id: sources
+        run: |
+          scripts/resolve-sources.sh "$RUNNER_TEMP/src" | tee sources.env
+          cat sources.env >> "$GITHUB_OUTPUT"
+
+      - name: Plan Proxmox mirror
+        run: python3 scripts/mirror_proxmox.py plan > mirror-plan.json
+
+      - name: Build manifest
+        run: |
+          scripts/make-manifest.sh sources.env mirror-plan.json > manifest.json
+          cat manifest.json
+
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          key="$(jq -r .key manifest.json)"
+          version="$(jq -r .build.version manifest.json)"
+          old_key=""
+          if gh release download --repo "$GITHUB_REPOSITORY" --pattern manifest.json --output old-manifest.json 2>/dev/null; then
+            old_key="$(jq -r .key old-manifest.json)"
+          fi
+          # nächste freie Revision für diese Upstream-Version
+          last="$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 --json tagName --jq '.[].tagName' \
+            | sed -n "s/^v${version//./\\.}-r\([0-9]\+\)$/\1/p" | sort -n | tail -1)"
+          revision=$(( ${last:-0} + 1 ))
+          if [ "$key" != "$old_key" ] || [ "$FORCE" = "true" ]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "Neues Release: v${version}-r${revision}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            echo "Keine Änderungen seit dem letzten Release." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}-r${revision}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: manifest
+          path: manifest.json
+
+      # GitHub deaktiviert geplante Workflows nach 60 Tagen ohne Repo-Aktivität.
+      - name: Keepalive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/enable"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["22.04", "24.04", "26.04"]
+        arch: [amd64, arm64]
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    name: build (ubuntu ${{ matrix.ubuntu }}, ${{ matrix.arch }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and package
+        run: |
+          docker build -f docker/Dockerfile -t build \
+            --build-arg UBUNTU_VERSION=${{ matrix.ubuntu }} \
+            --build-arg REVISION=${{ needs.plan.outputs.revision }} \
+            --build-arg PBS_COMMIT=${{ needs.plan.outputs.PBS_COMMIT }} \
+            --build-arg PROXMOX_COMMIT=${{ needs.plan.outputs.PROXMOX_COMMIT }} \
+            --build-arg PXAR_COMMIT=${{ needs.plan.outputs.PXAR_COMMIT }} \
+            --build-arg PATHPATTERNS_COMMIT=${{ needs.plan.outputs.PATHPATTERNS_COMMIT }} \
+            --build-arg PROXMOX_FUSE_COMMIT=${{ needs.plan.outputs.PROXMOX_FUSE_COMMIT }} \
+            .
+          cid="$(docker create build)"
+          docker cp "$cid:/out" out
+          docker rm "$cid"
+          ls -l out
+
+      - name: Install test in clean container
+        run: |
+          docker run --rm -v "$PWD/out:/out:ro" ubuntu:${{ matrix.ubuntu }} bash -euxc '
+            apt-get update -qq
+            apt-get install -y -qq /out/*.deb
+            proxmox-backup-client version
+            mkdir -p /t/in && echo test > /t/in/a && pxar create /t/a.pxar /t/in
+            mkdir /t/out && pxar extract /t/a.pxar /t/out && diff -r /t/in /t/out
+          '
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: build-ubuntu${{ matrix.ubuntu }}-${{ matrix.arch }}
+          path: out/*
+
+  mirror:
+    needs: plan
+    if: needs.plan.outputs.release == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download and verify Proxmox packages
+        run: python3 scripts/mirror_proxmox.py download out
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mirror
+          path: out/*.deb
+
+  release:
+    needs: [plan, build, mirror]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write release notes
+        run: |
+          jq -r '
+            "Automatischer Build. Die Pakete werden über [debian-collection-repo](https://the78mole.github.io/debian-collection-repo/) verteilt.",
+            "",
+            "## Eigene Builds (Ubuntu)",
+            "",
+            "Upstream-Version **\(.build.version)**, gebaut aus (AGPL-3.0, Quellcode):",
+            "",
+            (.build.commits | to_entries[] | "- `\(.key)` [\(.value[0:12])](https://git.proxmox.com/?p=\(.key).git;a=commit;h=\(.value))"),
+            "",
+            "Build-Anpassungen: `scripts/build-client.sh` in diesem Tag. `Cargo.lock` je Build liegt bei.",
+            "",
+            "## Gespiegelte Originalpakete von Proxmox",
+            "",
+            "| Ziel | Paket | Version | Arch | Quelle |",
+            "|---|---|---|---|---|",
+            (.mirror[] | "| \(.target) | \(.package) | \(.version) | \(.arch) | pbs-client \(.source) |")
+          ' dist/manifest.json > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file notes.md dist/*
