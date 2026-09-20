@@ -4,9 +4,9 @@
 Alles wird gegen die mitgelieferten Proxmox-Schlüssel (keys/) geprüft:
 InRelease-Signatur -> SHA256 der Packages-Datei -> SHA256 jedes .deb.
 
-Die Dateien werden umbenannt (``<paket>_<version>+debian<N>_<arch>.deb``), damit
-debian-collection-repo sie der richtigen Distribution zuordnet. Der Paketinhalt
-bleibt unverändert.
+Die Dateien werden umbenannt (``<paket>_<version>+debian13_<arch>.deb``,
+``+ubuntu24.04`` usw.), damit debian-collection-repo sie der richtigen Distribution
+zuordnet. Der Paketinhalt bleibt unverändert.
 
 Nutzung:
   mirror_proxmox.py plan              # JSON der Auswahl auf stdout, lädt keine .debs
@@ -31,15 +31,25 @@ SUITE_KEYS = {
     "bookworm": KEYS / "proxmox-release-bookworm.gpg",
 }
 
-# (Ziel-Distribution, Debian-Version, Quell-Suite, Quell-Komponente, Architektur, Pakete)
+STATIC = ["proxmox-backup-client-static"]
+
+# (Ziel-Suite, Dateinamen-Kennung, Quell-Suite, Quell-Komponente, Architektur, Pakete)
 SELECTIONS = [
-    ("trixie", "13", "trixie", "main", "amd64", PACKAGES),
+    ("trixie", "debian13", "trixie", "main", "amd64", PACKAGES),
     # arm64 gibt es bei Proxmox bisher nur in "test"
-    ("trixie", "13", "trixie", "test", "arm64", PACKAGES),
-    ("bookworm", "12", "bookworm", "main", "amd64", PACKAGES),
+    ("trixie", "debian13", "trixie", "test", "arm64", PACKAGES),
+    ("bookworm", "debian12", "bookworm", "main", "amd64", PACKAGES),
     # Für bookworm/arm64 (z. B. Raspberry Pi OS 12) gibt es nichts: das statisch
     # gelinkte trixie-Paket hängt nur von qrencode ab und läuft dort.
-    ("bookworm", "12", "trixie", "test", "arm64", ["proxmox-backup-client-static"]),
+    ("bookworm", "debian12", "trixie", "test", "arm64", STATIC),
+    # Ubuntu: nur das statische Paket als Alternative zu den eigenen Builds. Es hängt
+    # nur von qrencode ab und läuft unverändert auf 22.04, 24.04 und 26.04.
+    ("jammy", "ubuntu22.04", "trixie", "main", "amd64", STATIC),
+    ("jammy", "ubuntu22.04", "trixie", "test", "arm64", STATIC),
+    ("noble", "ubuntu24.04", "trixie", "main", "amd64", STATIC),
+    ("noble", "ubuntu24.04", "trixie", "test", "arm64", STATIC),
+    ("resolute", "ubuntu26.04", "trixie", "main", "amd64", STATIC),
+    ("resolute", "ubuntu26.04", "trixie", "test", "arm64", STATIC),
 ]
 
 
@@ -95,16 +105,19 @@ def version_gt(a: str, b: str) -> bool:
 
 def plan() -> list[dict[str, str]]:
     releases: dict[str, dict[str, str]] = {}
+    indexes: dict[tuple[str, str], list[dict[str, str]]] = {}
     result = []
-    for target, debver, suite, component, arch, packages in SELECTIONS:
+    for target, tag, suite, component, arch, packages in SELECTIONS:
         if suite not in releases:
             releases[suite] = release_sha256(verified_release(suite))
         index = f"{component}/binary-{arch}/Packages.gz"
-        raw = fetch(f"{BASE}/dists/{suite}/{index}")
-        if hashlib.sha256(raw).hexdigest() != releases[suite].get(index):
-            raise SystemExit(f"SHA256 von {suite}/{index} passt nicht zu InRelease")
+        if (suite, index) not in indexes:
+            raw = fetch(f"{BASE}/dists/{suite}/{index}")
+            if hashlib.sha256(raw).hexdigest() != releases[suite].get(index):
+                raise SystemExit(f"SHA256 von {suite}/{index} passt nicht zu InRelease")
+            indexes[(suite, index)] = parse_packages(gzip.decompress(raw).decode())
         latest: dict[str, dict[str, str]] = {}
-        for pkg in parse_packages(gzip.decompress(raw).decode()):
+        for pkg in indexes[(suite, index)]:
             name = pkg.get("Package")
             if name in packages and (name not in latest or version_gt(pkg["Version"], latest[name]["Version"])):
                 latest[name] = pkg
@@ -121,7 +134,7 @@ def plan() -> list[dict[str, str]]:
                     "arch": arch,
                     "url": f"{BASE}/{pkg['Filename']}",
                     "sha256": pkg["SHA256"],
-                    "filename": f"{name}_{pkg['Version']}+debian{debver}_{arch}.deb",
+                    "filename": f"{name}_{pkg['Version']}+{tag}_{arch}.deb",
                 }
             )
     return result
@@ -129,11 +142,14 @@ def plan() -> list[dict[str, str]]:
 
 def download(outdir: Path) -> None:
     outdir.mkdir(parents=True, exist_ok=True)
+    cache: dict[str, bytes] = {}
     for item in plan():
-        data = fetch(item["url"])
-        if hashlib.sha256(data).hexdigest() != item["sha256"]:
-            raise SystemExit(f"SHA256 von {item['url']} stimmt nicht")
-        (outdir / item["filename"]).write_bytes(data)
+        if item["sha256"] not in cache:
+            data = fetch(item["url"])
+            if hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise SystemExit(f"SHA256 von {item['url']} stimmt nicht")
+            cache[item["sha256"]] = data
+        (outdir / item["filename"]).write_bytes(cache[item["sha256"]])
         print(f"{item['filename']}  <- {item['source']}", file=sys.stderr)
 
 

@@ -14,16 +14,32 @@ Du trägst nur ein APT-Repository ein:
 
 ## Was es gibt
 
-| System | Suite | amd64 | arm64 | Herkunft |
-|---|---|---|---|---|
-| Ubuntu 22.04 / Mint 21 | `jammy` | ✅ | ✅ | eigener Build |
-| Ubuntu 24.04 / Mint 22 | `noble` | ✅ | ✅ | eigener Build |
-| Ubuntu 26.04 | `resolute` | ✅ | ✅ | eigener Build |
-| Debian 13 / Raspberry Pi OS (trixie) | `trixie` | ✅ Proxmox `main` | ✅ Proxmox **`test`** | Original, gespiegelt |
-| Debian 12 / Raspberry Pi OS (bookworm) | `bookworm` | ✅ Proxmox `main` (3.4.x) | ⚠️ nur `-static` aus trixie `test` | Original, gespiegelt |
+| System | Suite | `proxmox-backup-client` | `proxmox-backup-client-static` |
+|---|---|---|---|
+| Ubuntu 22.04 / Mint 21 | `jammy` | eigener Build (amd64, arm64) | Proxmox-Original, gespiegelt |
+| Ubuntu 24.04 / Mint 22 | `noble` | eigener Build (amd64, arm64) | Proxmox-Original, gespiegelt |
+| Ubuntu 26.04 | `resolute` | eigener Build (amd64, arm64) | Proxmox-Original, gespiegelt |
+| Debian 13 / Raspberry Pi OS (trixie) | `trixie` | Original: amd64 `main`, arm64 **`test`** | Original, gespiegelt |
+| Debian 12 / Raspberry Pi OS (bookworm) | `bookworm` | Original `main`, nur amd64 (3.4.x) | amd64 aus `bookworm`, arm64 aus trixie **`test`** |
 
 32-Bit (armhf) gibt es nicht. Proxmox baut dafür nichts, und der Code unterstützt die
 Architektur nicht.
+
+### Welche Variante nehmen?
+
+Auf Ubuntu gibt es beide. **Standard ist `proxmox-backup-client`**, der eigene Build.
+
+| | eigener Build (dynamisch gelinkt) | `-static` (Proxmox-Original) |
+|---|---|---|
+| OpenSSL | System-Bibliothek, Sicherheitsupdates über `apt upgrade` | fest eingebaut, kommt erst mit einem Proxmox-Rebuild |
+| Version | aktueller Upstream-Stand (Quellcode) | Proxmox-Releasestand, arm64 hinkt oft nach |
+| Größe installiert | ca. 17 MB | ca. 32 MB |
+| Herkunft | hier gebaut | Binary von Proxmox, unverändert |
+
+Das statische Paket ist die Rückfalloption: Es hängt nur von `qrencode` ab, läuft auf
+allen drei Ubuntu-Versionen und ist nützlich, wenn du lieber ausschließlich
+Proxmox-Binaries einsetzt oder ein eigener Build einmal ausfällt. Die beiden Pakete
+schließen sich gegenseitig aus (`Conflicts`), wie bei Proxmox selbst.
 
 ## Installation
 
@@ -34,7 +50,9 @@ curl -fsSL https://the78mole.github.io/debian-collection-repo/public.key \
 echo "deb [signed-by=/usr/share/keyrings/debian-collection-repo.gpg] https://the78mole.github.io/debian-collection-repo ${UBUNTU_CODENAME:-$VERSION_CODENAME} main" \
   | sudo tee /etc/apt/sources.list.d/debian-collection-repo.list
 sudo apt update
-sudo apt install proxmox-backup-client     # oder: proxmox-backup-client-static (nur Debian)
+sudo apt install proxmox-backup-client            # empfohlen
+# oder, ohne Systembibliotheken:
+# sudo apt install proxmox-backup-client-static
 ```
 
 `${UBUNTU_CODENAME:-$VERSION_CODENAME}` sorgt dafür, dass Linux Mint die passende
@@ -57,11 +75,12 @@ Proxmox APT ─┘   Ubuntu-Builds + Spiegel      (.debs, Manifest)    (sortiert
    passenden `ubuntu:<version>`-Image (arm64 auf nativen arm64-Runnern) und paketiert mit
    `scripts/package-deb.sh`. Danach wird das Paket in einem frischen Container per apt
    installiert und getestet.
-3. **Spiegeln** (`mirror`): `scripts/mirror_proxmox.py download` lädt die Originalpakete.
+3. **Spiegeln** (`mirror`): `scripts/mirror_proxmox.py download` lädt die Originalpakete
+   (welche, steht in `SELECTIONS` in diesem Skript).
    Die Signatur der `InRelease`-Datei wird gegen die Proxmox-Schlüssel in `keys/` geprüft,
    danach die SHA256-Summen von Index und Paket. Die Dateien bekommen `+debian12` bzw.
-   `+debian13` in den Namen, damit das Collection-Repo sie zuordnen kann. Der Inhalt
-   bleibt unverändert.
+   `+debian13` bzw. `+ubuntu24.04` in den Namen, damit das Collection-Repo sie zuordnen
+   kann. Der Inhalt bleibt unverändert, dieselbe Datei wird nur mehrfach benannt.
 4. **Veröffentlichen** (`release`): Tag `v<upstream-version>-r<n>` mit allen .debs,
    `manifest.json` und dem `Cargo.lock` jedes Builds.
 
